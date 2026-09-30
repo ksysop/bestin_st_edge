@@ -1,8 +1,26 @@
+local log = require "log"
+
+log.info("==============================================")
+log.info("🚨 1. 드라이버 코드 읽기 시작 (VM 부팅됨)")
+log.info("==============================================")
+
 local Driver = require "st.driver"
 local capabilities = require "st.capabilities"
-local log = require "log"
+
+log.info("🚨 2. 기본 모듈 로드 완료. socket_client 파일 읽기 시도 중...")
 local Client = require "socket_client"
+
+log.info("🚨 3. socket_client 통과! packet_parser 파일 읽기 시도 중...")
 local parser = require "packet_parser"
+
+log.info("🚨 4. 에러 없음! 모든 파일 로드 완료. 드라이버 대기 상태 돌입.")
+
+-- (아래부터는 기존의 on_ctrl_packet 등 함수들 그대로 유지)
+
+-- ★★★ 이 두 줄을 추가해 주세요 ★★★
+log.info("==============================================")
+log.info("🚀 Bestin Edge Driver 시작됨 (Lua VM 구동 완료)")
+log.info("==============================================")
 
 local ctrl_client = nil
 local energy_client = nil
@@ -57,7 +75,6 @@ local function on_energy_packet(driver, raw_pkt)
   end
 end
 
--- [장치 설정(Preferences) 반영 및 소켓 연결/갱신]
 local function apply_preferences(driver, device)
   local prefs = device.preferences or {}
   local ctrl_ip = prefs.ctrlIp
@@ -65,7 +82,7 @@ local function apply_preferences(driver, device)
   local energy_ip = prefs.energyIp
   local energy_port = prefs.energyPort or 8899
 
-  log.info(string.format("새 설정 반영: Control(%s:%s), Energy(%s:%s)",
+  log.info(string.format("설정 갱신: Control(%s:%s), Energy(%s:%s)",
     tostring(ctrl_ip), tostring(ctrl_port), tostring(energy_ip), tostring(energy_port)))
 
   if ctrl_client then ctrl_client:stop() end
@@ -80,7 +97,6 @@ local function apply_preferences(driver, device)
   energy_client:start()
 end
 
--- [명령 핸들러: 조명/콘센트]
 local function handle_switch(driver, device, command)
   local is_on = (command.command == "on")
   local dni = device.device_network_id
@@ -102,7 +118,6 @@ local function handle_switch(driver, device, command)
   end
 end
 
--- [명령 핸들러: 난방 희망온도]
 local function handle_setpoint(driver, device, command)
   local room = device.device_network_id:match("bestin%-thermo%-(%d+)")
   local target_temp = command.args.setpoint
@@ -113,7 +128,6 @@ local function handle_setpoint(driver, device, command)
   end
 end
 
--- [명령 핸들러: 난방 모드 (heat/off)]
 local function handle_thermostat_mode(driver, device, command)
   local room = device.device_network_id:match("bestin%-thermo%-(%d+)")
   local is_on = (command.args.mode == "heat")
@@ -125,23 +139,8 @@ local function handle_thermostat_mode(driver, device, command)
   end
 end
 
-local function device_init(driver, device)
-  if device.device_network_id == "bestin-bridge-device" then
-    apply_preferences(driver, device)
-  end
-end
-
-local function info_changed(driver, device, event, args)
-  if device.device_network_id == "bestin-bridge-device" then
-    apply_preferences(driver, device)
-  end
-end
-
--- [Discovery Handler]
-local function discovery_handler(driver, should_continue)
-  log.info("Bestin Bridge 검색 시작 (Discovery Started)...")
-  
-  -- 브릿지 디바이스 메타데이터
+local function create_bridge_device(driver)
+  log.info("Bestin Bridge 디바이스 생성 시도 중...")
   local bridge_metadata = {
     type = "LAN",
     device_network_id = "bestin-bridge-device",
@@ -151,20 +150,33 @@ local function discovery_handler(driver, should_continue)
     model = "Bestin-Dual-EW11",
     vendor_provided_label = "Bestin Bridge"
   }
-
   local dev, err = driver:try_create_device(bridge_metadata)
   if dev then
-    log.info("Bestin Bridge 디바이스 생성 성공!")
+    log.info("Bestin Bridge 생성 성공!")
   else
-    log.warn("Bestin Bridge 생성 결과: " .. tostring(err))
+    log.warn("Bestin Bridge 생성 결과/오류: " .. tostring(err))
   end
+end
+
+local function discovery_handler(driver, should_continue)
+  log.info("=== 주변 검색 트리거 수신됨 ===")
+  create_bridge_device(driver)
 end
 
 local bestin_driver = Driver("bestin-wallpad", {
   discovery = discovery_handler,
   lifecycle_handlers = {
-    init = device_init,
-    infoChanged = info_changed
+    init = function(driver, device)
+      log.info("디바이스 초기화: " .. device.label)
+      if device.device_network_id == "bestin-bridge-device" then
+        apply_preferences(driver, device)
+      end
+    end,
+    infoChanged = function(driver, device, event, args)
+      if device.device_network_id == "bestin-bridge-device" then
+        apply_preferences(driver, device)
+      end
+    end
   },
   capability_handlers = {
     [capabilities.switch.ID] = {
