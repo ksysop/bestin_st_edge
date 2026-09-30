@@ -1,4 +1,6 @@
 name: "Bestin Wallpad Edge Driver"
-packageKey: "bestin-wallpad-edge-driver"
+packageKey: "bestin-wallpad-edge-driver-v2"
+
 permissions:
   lan: {}
+  discovery: {}
