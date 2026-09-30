@@ -15,6 +15,7 @@ preferences:
     required: false
     preferenceType: string
     definition:
+      stringType: text
       default: ""
 
   - name: ctrlPort
@@ -33,6 +34,7 @@ preferences:
     required: false
     preferenceType: string
     definition:
+      stringType: text
       default: ""
 
   - name: energyPort
