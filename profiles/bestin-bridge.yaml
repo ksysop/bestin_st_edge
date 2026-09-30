@@ -1,0 +1,46 @@
+name: bestin-bridge
+components:
+  - id: main
+    capabilities:
+      - id: bridge
+        version: 1
+      - id: refresh
+        version: 1
+    categories:
+      - name: Hub
+preferences:
+  - name: ctrlIp
+    title: "Control EW11 IP"
+    description: "난방/환기/가스 제어 라인 EW11 IP 주소"
+    required: false
+    preferenceType: string
+    definition:
+      default: ""
+
+  - name: ctrlPort
+    title: "Control EW11 Port"
+    description: "Control 라인 EW11 TCP 포트"
+    required: true
+    preferenceType: integer
+    definition:
+      default: 8899
+      minimum: 1
+      maximum: 65535
+
+  - name: energyIp
+    title: "Energy EW11 IP"
+    description: "조명/콘센트 라인 EW11 IP 주소"
+    required: false
+    preferenceType: string
+    definition:
+      default: ""
+
+  - name: energyPort
+    title: "Energy EW11 Port"
+    description: "Energy 라인 EW11 TCP 포트"
+    required: true
+    preferenceType: integer
+    definition:
+      default: 8899
+      minimum: 1
+      maximum: 65535
