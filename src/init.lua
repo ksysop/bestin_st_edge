@@ -137,17 +137,31 @@ local function info_changed(driver, device, event, args)
   end
 end
 
+-- [Discovery Handler]
+local function discovery_handler(driver, should_continue)
+  log.info("Bestin Bridge 검색 시작 (Discovery Started)...")
+  
+  -- 브릿지 디바이스 메타데이터
+  local bridge_metadata = {
+    type = "LAN",
+    device_network_id = "bestin-bridge-device",
+    label = "Bestin Bridge",
+    profile = "bestin-bridge",
+    manufacturer = "Local",
+    model = "Bestin-Dual-EW11",
+    vendor_provided_label = "Bestin Bridge"
+  }
+
+  local dev, err = driver:try_create_device(bridge_metadata)
+  if dev then
+    log.info("Bestin Bridge 디바이스 생성 성공!")
+  else
+    log.warn("Bestin Bridge 생성 결과: " .. tostring(err))
+  end
+end
+
 local bestin_driver = Driver("bestin-wallpad", {
-  discovery = function(driver, opts, cons)
-    driver:try_create_device({
-      type = "LAN",
-      device_network_id = "bestin-bridge-device",
-      label = "Bestin Bridge",
-      profile = "bestin-bridge",
-      manufacturer = "Local",
-      model = "Bestin-Dual-EW11"
-    })
-  end,
+  discovery = discovery_handler,
   lifecycle_handlers = {
     init = device_init,
     infoChanged = info_changed
