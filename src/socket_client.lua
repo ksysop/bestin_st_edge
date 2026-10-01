@@ -48,6 +48,7 @@ function Client:start()
           log.info(string.format("[%s] EW11 연결 시도 -> %s:%d", self.name, self.ip, self.port))
           local res, conn_err = s:connect(self.ip, self.port)
           if res then
+            s:setoption("tcp-nodelay", true)
             log.info(string.format("[%s] EW11 (%s:%d) 연결 성공!", self.name, self.ip, self.port))
             self.sock = s
             self:listen_loop()
@@ -69,7 +70,6 @@ function Client:listen_loop()
   local buffer = ""
   while self.running and self.sock do
     self.sock:settimeout(2)
-    -- *a 대신 청크 크기로 안전하게 읽어와 버퍼링 처리
     local chunk, err, partial = self.sock:receive(512)
     local data = chunk or partial
 
@@ -88,10 +88,8 @@ function Client:listen_loop()
 
         local pkt_len = buffer:byte(3)
         if pkt_len < 4 or pkt_len > 64 then
-          -- 유효하지 않은 패킷 길이인 경우 헤더 버리고 다음 탐색
           buffer = buffer:sub(2)
         elseif #buffer < pkt_len then
-          -- 아직 덜 들어온 패킷이므로 다음 청크 대기
           break
         else
           local packet_bytes = buffer:sub(1, pkt_len)
