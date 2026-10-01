@@ -10,7 +10,10 @@ local energy_client = nil
 local pending_energy_cmd = nil
 local pending_ctrl_cmd = nil
 
--- 바이트 배열을 16진수 문자열로 변환 (공백 구분)
+-- 캐시 테이블
+local device_cache = {}
+local last_state_cache = {}
+
 local function to_hex(raw_bytes)
   local hex = {}
   for i = 1, #raw_bytes do
@@ -19,11 +22,15 @@ local function to_hex(raw_bytes)
   return table.concat(hex, " ")
 end
 
--- [기기 탐색 및 생성]
+-- [기기 즉시 탐색 및 생성]
 local function find_or_create_device(driver, dni, label, profile)
-  for _, dev in ipairs(driver:get_devices()) do
-    if dev.device_network_id == dni then
-      return dev
+  local dev = device_cache[dni]
+  if dev then return dev end
+
+  for _, d in ipairs(driver:get_devices()) do
+    if d.device_network_id == dni then
+      device_cache[dni] = d
+      return d
     end
   end
 
@@ -57,16 +64,27 @@ local function on_ctrl_packet(driver, raw_pkt)
     local dev = find_or_create_device(driver, dni, string.format("난방 %d번방", res.room), "bestin-thermostat")
 
     if dev and dev.emit_event then
-      dev:emit_event(capabilities.thermostatMode.supportedThermostatModes({ "heat", "off" }))
-      dev:emit_event(capabilities.temperatureMeasurement.temperature({ value = res.current_temp, unit = "C" }))
-      dev:emit_event(capabilities.thermostatHeatingSetpoint.heatingSetpoint({ value = res.target_temp, unit = "C" }))
-      local mode = res.is_on and capabilities.thermostatMode.thermostatMode.heat() or capabilities.thermostatMode.thermostatMode.off()
-      dev:emit_event(mode)
+      last_state_cache[dni] = last_state_cache[dni] or {}
+      local c = last_state_cache[dni]
+
+      if c.temp ~= res.current_temp then
+        c.temp = res.current_temp
+        dev:emit_event(capabilities.temperatureMeasurement.temperature({ value = res.current_temp, unit = "C" }))
+      end
+      if c.setpoint ~= res.target_temp then
+        c.setpoint = res.target_temp
+        dev:emit_event(capabilities.thermostatHeatingSetpoint.heatingSetpoint({ value = res.target_temp, unit = "C" }))
+      end
+      if c.is_on ~= res.is_on then
+        c.is_on = res.is_on
+        dev:emit_event(capabilities.thermostatMode.supportedThermostatModes({ "heat", "off" }))
+        dev:emit_event(res.is_on and capabilities.thermostatMode.thermostatMode.heat() or capabilities.thermostatMode.thermostatMode.off())
+      end
     end
   end
 end
 
--- [Energy 패킷 수신: 조명, 콘센트 및 소비전력 원본 로그 출력]
+-- [Energy 패킷 수신: 조명, 콘센트 및 소비전력 즉시 동기화]
 local function on_energy_packet(driver, raw_pkt)
   if pending_energy_cmd and energy_client then
     local pkt = pending_energy_cmd
@@ -78,33 +96,39 @@ local function on_energy_packet(driver, raw_pkt)
   local res = parser.parse_energy_packet(raw_pkt)
   if not res then return end
 
-  local hex_str = to_hex(raw_pkt)
-
   if res.kind == "energy_combined" then
-    -- 1. 조명 상태 반영 + 원본 패킷 출력
+    -- 1. 조명 상태 반영
     for idx, is_on in ipairs(res.lights) do
       local light_dni = string.format("bestin-light-v2-r%d-c%d", res.room, idx)
-      local label = string.format("조명 %d번방 %d", res.room, idx)
-      local dev = find_or_create_device(driver, light_dni, label, "bestin-light")
+      local dev = find_or_create_device(driver, light_dni, string.format("조명 %d번방 %d", res.room, idx), "bestin-light")
       if dev and dev.emit_event then
-        dev:emit_event(is_on and capabilities.switch.switch.on() or capabilities.switch.switch.off())
+        last_state_cache[light_dni] = last_state_cache[light_dni] or {}
+        if last_state_cache[light_dni].switch ~= is_on then
+          last_state_cache[light_dni].switch = is_on
+          dev:emit_event(is_on and capabilities.switch.switch.on() or capabilities.switch.switch.off())
+        end
       end
     end
 
-    -- 2. 콘센트 상태 및 전력 반영 + 원본 패킷 로그 매핑
+    -- 2. 콘센트 상태 및 실시간 소비전력 반영
     for idx, is_on in ipairs(res.outlets) do
       local outlet_dni = string.format("bestin-outlet-v2-r%d-c%d", res.room, idx)
-      local label = string.format("콘센트 %d번방 %d", res.room, idx)
-      local dev = find_or_create_device(driver, outlet_dni, label, "bestin-outlet")
+      local dev = find_or_create_device(driver, outlet_dni, string.format("콘센트 %d번방 %d", res.room, idx), "bestin-outlet")
       if dev and dev.emit_event then
-        dev:emit_event(is_on and capabilities.switch.switch.on() or capabilities.switch.switch.off())
+        last_state_cache[outlet_dni] = last_state_cache[outlet_dni] or {}
+        local c = last_state_cache[outlet_dni]
 
-        local p = res.powers and res.powers[idx] or 0.0
-        dev:emit_event(capabilities.powerMeter.power({ value = p, unit = "W" }))
+        -- 스위치 상태 변경 즉시 전달
+        if c.switch ~= is_on then
+          c.switch = is_on
+          dev:emit_event(is_on and capabilities.switch.switch.on() or capabilities.switch.switch.off())
+        end
 
-        -- 콘센트 1번 로그에 30바이트 원본 패킷을 바로 확인 가능하도록 인포 출력
-        if idx == 1 then
-          log.info(string.format("📡 [%d번방 콘센트 상태수신] Raw: %s", res.room, hex_str))
+        -- 소비전력 0.2W 이상 변동 시 즉시 전달
+        local p = (res.powers and res.powers[idx]) or 0.0
+        if not c.power or math.abs(c.power - p) >= 0.2 then
+          c.power = p
+          dev:emit_event(capabilities.powerMeter.power({ value = p, unit = "W" }))
         end
       end
     end
@@ -139,9 +163,9 @@ local function handle_switch_on(driver, device, command)
   local dni = device.device_network_id
   log.info(string.format("👉 [제어: ON 요청] %s (%s)", device.label, dni))
 
+  -- 조명 제어
   local l_room, l_idx = dni:match("bestin%-light%-v2%-r(%d+)%-c(%d+)")
   if not l_room then l_room, l_idx = dni:match("bestin%-light%-(%d+)%-(%d+)") end
-
   if l_room and l_idx and energy_client then
     local pkt = parser.build_light_command(tonumber(l_room), tonumber(l_idx), true)
     log.warn(string.format("🚀 [조명 ON 송신] %s", to_hex(pkt)))
@@ -151,9 +175,9 @@ local function handle_switch_on(driver, device, command)
     return
   end
 
+  -- 콘센트 제어
   local o_room, o_idx = dni:match("bestin%-outlet%-v2%-r(%d+)%-c(%d+)")
   if not o_room then o_room, o_idx = dni:match("bestin%-outlet%-(%d+)%-(%d+)") end
-
   if o_room and o_idx and energy_client then
     local pkt = parser.build_outlet_command(tonumber(o_room), tonumber(o_idx), true)
     log.warn(string.format("🚀 [콘센트 ON 송신] %s", to_hex(pkt)))
@@ -169,9 +193,9 @@ local function handle_switch_off(driver, device, command)
   local dni = device.device_network_id
   log.info(string.format("👉 [제어: OFF 요청] %s (%s)", device.label, dni))
 
+  -- 조명 제어
   local l_room, l_idx = dni:match("bestin%-light%-v2%-r(%d+)%-c(%d+)")
   if not l_room then l_room, l_idx = dni:match("bestin%-light%-(%d+)%-(%d+)") end
-
   if l_room and l_idx and energy_client then
     local pkt = parser.build_light_command(tonumber(l_room), tonumber(l_idx), false)
     log.warn(string.format("🚀 [조명 OFF 송신] %s", to_hex(pkt)))
@@ -181,9 +205,9 @@ local function handle_switch_off(driver, device, command)
     return
   end
 
+  -- 콘센트 제어
   local o_room, o_idx = dni:match("bestin%-outlet%-v2%-r(%d+)%-c(%d+)")
   if not o_room then o_room, o_idx = dni:match("bestin%-outlet%-(%d+)%-(%d+)") end
-
   if o_room and o_idx and energy_client then
     local pkt = parser.build_outlet_command(tonumber(o_room), tonumber(o_idx), false)
     log.warn(string.format("🚀 [콘센트 OFF 송신] %s", to_hex(pkt)))
@@ -247,12 +271,17 @@ local bestin_driver = Driver("bestin-wallpad", {
   discovery = discovery_handler,
   lifecycle_handlers = {
     init = function(driver, device)
+      device_cache[device.device_network_id] = device
       if device.device_network_id:find("bestin%-thermo") then
         device:emit_event(capabilities.thermostatMode.supportedThermostatModes({ "heat", "off" }))
       end
       if device.device_network_id == "bestin-bridge-device" then
         apply_preferences(driver, device)
       end
+    end,
+    removed = function(driver, device)
+      device_cache[device.device_network_id] = nil
+      last_state_cache[device.device_network_id] = nil
     end,
     doConfigure = function(driver, device)
     end,

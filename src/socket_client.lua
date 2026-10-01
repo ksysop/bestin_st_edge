@@ -69,7 +69,8 @@ end
 function Client:listen_loop()
   local buffer = ""
   while self.running and self.sock do
-    self.sock:settimeout(2)
+    -- [초고속 반응 핵심] 타임아웃을 10ms로 극단적 단축하여 블로킹 대기시간 소멸
+    self.sock:settimeout(0.01)
     local chunk, err, partial = self.sock:receive(512)
     local data = chunk or partial
 
@@ -111,7 +112,7 @@ end
 
 function Client:send(payload)
   if self.sock then
-    self.sock:settimeout(2)
+    self.sock:settimeout(1)
     local res, err = self.sock:send(payload)
     if not res then
       log.error(string.format("[%s] 송신 실패: %s", self.name, tostring(err)))
