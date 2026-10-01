@@ -1,16 +1,14 @@
 local Driver = require "st.driver"
 local capabilities = require "st.capabilities"
 local log = require "log"
+local cosock = require "cosock"
 local Client = require "socket_client"
 local parser = require "packet_parser"
 
 local ctrl_client = nil
 local energy_client = nil
 
-local pending_energy_cmd = nil
-local pending_ctrl_cmd = nil
-
--- 캐시 테이블
+-- 기기 및 상태 캐시
 local device_cache = {}
 local last_state_cache = {}
 
@@ -22,7 +20,18 @@ local function to_hex(raw_bytes)
   return table.concat(hex, " ")
 end
 
--- [기기 즉시 탐색 및 생성]
+-- [안정적인 3회 Burst 전송] RS-485 충돌 극복을 위해 30ms 간격으로 3회 발송
+local function burst_send(client, pkt)
+  if not client then return end
+  cosock.spawn(function()
+    for _ = 1, 3 do
+      client:send(pkt)
+      cosock.socket.sleep(0.03) -- 30ms 간격
+    end
+  end, "burst_sender")
+end
+
+-- [기기 탐색 및 캐싱]
 local function find_or_create_device(driver, dni, label, profile)
   local dev = device_cache[dni]
   if dev then return dev end
@@ -49,13 +58,6 @@ end
 
 -- [Control 패킷 수신: 난방]
 local function on_ctrl_packet(driver, raw_pkt)
-  if pending_ctrl_cmd and ctrl_client then
-    local pkt = pending_ctrl_cmd
-    pending_ctrl_cmd = nil
-    ctrl_client:send(pkt)
-    log.info("⚡ [Control 슬롯 동기화 전송 완료]")
-  end
-
   local res = parser.parse_control_packet(raw_pkt)
   if not res then return end
 
@@ -84,15 +86,8 @@ local function on_ctrl_packet(driver, raw_pkt)
   end
 end
 
--- [Energy 패킷 수신: 조명, 콘센트 및 소비전력 즉시 동기화]
+-- [Energy 패킷 수신: 조명, 콘센트 및 소비전력]
 local function on_energy_packet(driver, raw_pkt)
-  if pending_energy_cmd and energy_client then
-    local pkt = pending_energy_cmd
-    pending_energy_cmd = nil
-    energy_client:send(pkt)
-    log.info("⚡ [Energy 슬롯 동기화 전송 완료]")
-  end
-
   local res = parser.parse_energy_packet(raw_pkt)
   if not res then return end
 
@@ -118,13 +113,11 @@ local function on_energy_packet(driver, raw_pkt)
         last_state_cache[outlet_dni] = last_state_cache[outlet_dni] or {}
         local c = last_state_cache[outlet_dni]
 
-        -- 스위치 상태 변경 즉시 전달
         if c.switch ~= is_on then
           c.switch = is_on
           dev:emit_event(is_on and capabilities.switch.switch.on() or capabilities.switch.switch.off())
         end
 
-        -- 소비전력 0.2W 이상 변동 시 즉시 전달
         local p = (res.powers and res.powers[idx]) or 0.0
         if not c.power or math.abs(c.power - p) >= 0.2 then
           c.power = p
@@ -163,15 +156,15 @@ local function handle_switch_on(driver, device, command)
   local dni = device.device_network_id
   log.info(string.format("👉 [제어: ON 요청] %s (%s)", device.label, dni))
 
+  device:emit_event(capabilities.switch.switch.on())
+
   -- 조명 제어
   local l_room, l_idx = dni:match("bestin%-light%-v2%-r(%d+)%-c(%d+)")
   if not l_room then l_room, l_idx = dni:match("bestin%-light%-(%d+)%-(%d+)") end
   if l_room and l_idx and energy_client then
     local pkt = parser.build_light_command(tonumber(l_room), tonumber(l_idx), true)
-    log.warn(string.format("🚀 [조명 ON 송신] %s", to_hex(pkt)))
-    pending_energy_cmd = pkt
-    energy_client:send(pkt)
-    device:emit_event(capabilities.switch.switch.on())
+    log.warn(string.format("🚀 [조명 ON 즉시 Burst 송신] %s", to_hex(pkt)))
+    burst_send(energy_client, pkt)
     return
   end
 
@@ -180,10 +173,8 @@ local function handle_switch_on(driver, device, command)
   if not o_room then o_room, o_idx = dni:match("bestin%-outlet%-(%d+)%-(%d+)") end
   if o_room and o_idx and energy_client then
     local pkt = parser.build_outlet_command(tonumber(o_room), tonumber(o_idx), true)
-    log.warn(string.format("🚀 [콘센트 ON 송신] %s", to_hex(pkt)))
-    pending_energy_cmd = pkt
-    energy_client:send(pkt)
-    device:emit_event(capabilities.switch.switch.on())
+    log.warn(string.format("🚀 [콘센트 ON 즉시 Burst 송신] %s", to_hex(pkt)))
+    burst_send(energy_client, pkt)
     return
   end
 end
@@ -193,15 +184,15 @@ local function handle_switch_off(driver, device, command)
   local dni = device.device_network_id
   log.info(string.format("👉 [제어: OFF 요청] %s (%s)", device.label, dni))
 
+  device:emit_event(capabilities.switch.switch.off())
+
   -- 조명 제어
   local l_room, l_idx = dni:match("bestin%-light%-v2%-r(%d+)%-c(%d+)")
   if not l_room then l_room, l_idx = dni:match("bestin%-light%-(%d+)%-(%d+)") end
   if l_room and l_idx and energy_client then
     local pkt = parser.build_light_command(tonumber(l_room), tonumber(l_idx), false)
-    log.warn(string.format("🚀 [조명 OFF 송신] %s", to_hex(pkt)))
-    pending_energy_cmd = pkt
-    energy_client:send(pkt)
-    device:emit_event(capabilities.switch.switch.off())
+    log.warn(string.format("🚀 [조명 OFF 즉시 Burst 송신] %s", to_hex(pkt)))
+    burst_send(energy_client, pkt)
     return
   end
 
@@ -210,10 +201,8 @@ local function handle_switch_off(driver, device, command)
   if not o_room then o_room, o_idx = dni:match("bestin%-outlet%-(%d+)%-(%d+)") end
   if o_room and o_idx and energy_client then
     local pkt = parser.build_outlet_command(tonumber(o_room), tonumber(o_idx), false)
-    log.warn(string.format("🚀 [콘센트 OFF 송신] %s", to_hex(pkt)))
-    pending_energy_cmd = pkt
-    energy_client:send(pkt)
-    device:emit_event(capabilities.switch.switch.off())
+    log.warn(string.format("🚀 [콘센트 OFF 즉시 Burst 송신] %s", to_hex(pkt)))
+    burst_send(energy_client, pkt)
     return
   end
 end
@@ -224,13 +213,12 @@ local function handle_setpoint(driver, device, command)
   local target_temp = command.args.setpoint
   log.info(string.format("👉 [난방 온도] %s -> %.1f°C", device.label, target_temp))
 
+  device:emit_event(capabilities.thermostatHeatingSetpoint.heatingSetpoint({ value = target_temp, unit = "C" }))
   if room and ctrl_client then
     local cur_mode = device:get_latest_state("main", capabilities.thermostatMode.ID, capabilities.thermostatMode.thermostatMode.NAME)
     local is_on = (cur_mode == "heat")
     local pkt = parser.build_thermostat_command(tonumber(room), is_on, target_temp)
-    pending_ctrl_cmd = pkt
-    ctrl_client:send(pkt)
-    device:emit_event(capabilities.thermostatHeatingSetpoint.heatingSetpoint({ value = target_temp, unit = "C" }))
+    burst_send(ctrl_client, pkt)
   end
 end
 
@@ -240,12 +228,11 @@ local function handle_thermostat_mode(driver, device, command)
   local is_on = (mode == "heat")
   log.info(string.format("👉 [난방 모드] %s -> %s", device.label, mode))
 
+  device:emit_event(is_on and capabilities.thermostatMode.thermostatMode.heat() or capabilities.thermostatMode.thermostatMode.off())
   if room and ctrl_client then
     local cur_setpoint = device:get_latest_state("main", capabilities.thermostatHeatingSetpoint.ID, capabilities.thermostatHeatingSetpoint.heatingSetpoint.NAME) or 22
     local pkt = parser.build_thermostat_command(tonumber(room), is_on, cur_setpoint)
-    pending_ctrl_cmd = pkt
-    ctrl_client:send(pkt)
-    device:emit_event(is_on and capabilities.thermostatMode.thermostatMode.heat() or capabilities.thermostatMode.thermostatMode.off())
+    burst_send(ctrl_client, pkt)
   end
 end
 
