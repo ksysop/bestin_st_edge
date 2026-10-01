@@ -37,12 +37,11 @@ function Client:start()
   cosock.spawn(function()
     while self.running do
       if not is_valid_ip(self.ip) or not self.port then
-        log.info(string.format("[%s] IP/Port 미설정 상태. 앱 설정(Preferences) 입력을 대기합니다.", self.name))
         socket.sleep(5)
       else
         local s, err = socket.tcp()
         if not s then
-          log.error(string.format("[%s] TCP 소켓 초기화 실패: %s", self.name, tostring(err)))
+          log.error(string.format("[%s] TCP 소켓 생성 실패: %s", self.name, tostring(err)))
           socket.sleep(5)
         else
           s:settimeout(5)
@@ -53,12 +52,14 @@ function Client:start()
             self.sock = s
             self:listen_loop()
           else
-            log.warn(string.format("[%s] 연결 실패 (%s), 5초 후 재시도", self.name, tostring(conn_err)))
+            log.warn(string.format("[%s] 연결 실패: %s (5초 후 재시도)", self.name, tostring(conn_err)))
           end
-          if self.sock then self.sock:close() end
-          self.sock = nil
+          if self.sock then
+            pcall(function() self.sock:close() end)
+            self.sock = nil
+          end
         end
-        socket.sleep(5)
+        socket.sleep(3)
       end
     end
   end, "rx_" .. self.name)
@@ -66,10 +67,12 @@ end
 
 function Client:listen_loop()
   local buffer = ""
-  while self.running do
-    self.sock:settimeout(1)
-    local chunk, err, partial = self.sock:receive("*a")
+  while self.running and self.sock do
+    self.sock:settimeout(2)
+    -- *a 대신 청크 크기로 안전하게 읽어와 버퍼링 처리
+    local chunk, err, partial = self.sock:receive(512)
     local data = chunk or partial
+
     if data and #data > 0 then
       buffer = buffer .. data
       while #buffer > 0 do
@@ -84,15 +87,25 @@ function Client:listen_loop()
         if #buffer < 3 then break end
 
         local pkt_len = buffer:byte(3)
-        if #buffer < pkt_len then break end
-
-        local packet_bytes = buffer:sub(1, pkt_len)
-        buffer = buffer:sub(pkt_len + 1)
-        self.on_packet_cb(packet_bytes)
+        if pkt_len < 4 or pkt_len > 64 then
+          -- 유효하지 않은 패킷 길이인 경우 헤더 버리고 다음 탐색
+          buffer = buffer:sub(2)
+        elseif #buffer < pkt_len then
+          -- 아직 덜 들어온 패킷이므로 다음 청크 대기
+          break
+        else
+          local packet_bytes = buffer:sub(1, pkt_len)
+          buffer = buffer:sub(pkt_len + 1)
+          local ok, p_err = pcall(self.on_packet_cb, packet_bytes)
+          if not ok then
+            log.error(string.format("[%s] 패킷 콜백 예외: %s", self.name, tostring(p_err)))
+          end
+        end
       end
     end
+
     if err and err ~= "timeout" then
-      log.error(string.format("[%s] 통신 세션 종료: %s", self.name, tostring(err)))
+      log.error(string.format("[%s] 소켓 오류 발생: %s", self.name, tostring(err)))
       break
     end
   end
@@ -100,15 +113,22 @@ end
 
 function Client:send(payload)
   if self.sock then
-    return self.sock:send(payload)
+    self.sock:settimeout(2)
+    local res, err = self.sock:send(payload)
+    if not res then
+      log.error(string.format("[%s] 송신 실패: %s", self.name, tostring(err)))
+      pcall(function() self.sock:close() end)
+      self.sock = nil
+    end
+    return res, err
   end
-  return nil, string.format("[%s] EW11 소켓이 연결되어 있지 않습니다.", self.name)
+  return nil, "소켓 미연결"
 end
 
 function Client:stop()
   self.running = false
   if self.sock then
-    self.sock:close()
+    pcall(function() self.sock:close() end)
     self.sock = nil
   end
 end
