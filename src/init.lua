@@ -8,8 +8,9 @@ local parser = require "packet_parser"
 local ctrl_client = nil
 local energy_client = nil
 
--- 기기 및 상태 캐시
-local device_cache = {}
+-- [1. 장치 고속 인덱싱 맵: O(1) 접근]
+-- device_map[room] = { lights = { [1] = dev, [2] = dev }, outlets = { [1] = dev, [2] = dev }, thermo = dev }
+local device_map = {}
 local last_state_cache = {}
 
 local function to_hex(raw_bytes)
@@ -20,40 +21,65 @@ local function to_hex(raw_bytes)
   return table.concat(hex, " ")
 end
 
--- [안정적인 3회 Burst 전송] RS-485 충돌 극복을 위해 30ms 간격으로 3회 발송
-local function burst_send(client, pkt)
-  if not client then return end
-  cosock.spawn(function()
-    for _ = 1, 3 do
-      client:send(pkt)
-      cosock.socket.sleep(0.03) -- 30ms 간격
-    end
-  end, "burst_sender")
+-- [장치 등록 및 인덱싱 캐시 갱신]
+local function register_device_to_map(device)
+  local dni = device.device_network_id
+
+  local l_room, l_idx = dni:match("bestin%-light%-v2%-r(%d+)%-c(%d+)")
+  if l_room and l_idx then
+    local r, idx = tonumber(l_room), tonumber(l_idx)
+    device_map[r] = device_map[r] or { lights = {}, outlets = {} }
+    device_map[r].lights[idx] = device
+    return
+  end
+
+  local o_room, o_idx = dni:match("bestin%-outlet%-v2%-r(%d+)%-c(%d+)")
+  if o_room and o_idx then
+    local r, idx = tonumber(o_room), tonumber(o_idx)
+    device_map[r] = device_map[r] or { lights = {}, outlets = {} }
+    device_map[r].outlets[idx] = device
+    return
+  end
+
+  local t_room = dni:match("bestin%-thermo%-(%d+)")
+  if t_room then
+    local r = tonumber(t_room)
+    device_map[r] = device_map[r] or { lights = {}, outlets = {} }
+    device_map[r].thermo = device
+    return
+  end
 end
 
--- [기기 탐색 및 캐싱]
+-- [기기 자동 생성 보조]
 local function find_or_create_device(driver, dni, label, profile)
-  local dev = device_cache[dni]
-  if dev then return dev end
-
   for _, d in ipairs(driver:get_devices()) do
     if d.device_network_id == dni then
-      device_cache[dni] = d
+      register_device_to_map(d)
       return d
     end
   end
 
-  log.info(string.format("새 장치 등록 시도: [%s] %s (Profile: %s)", dni, label, profile))
-  local metadata = {
+  log.info(string.format("새 장치 등록 시도: [%s] %s", dni, label))
+  driver:try_create_device({
     type = "LAN",
     device_network_id = dni,
     label = label,
     profile = profile,
     manufacturer = "Bestin",
     model = "Bestin-SubDevice"
-  }
-  driver:try_create_device(metadata)
+  })
   return nil
+end
+
+-- [경량 Burst 송신]
+local function burst_send(client, pkt)
+  if not client then return end
+  cosock.spawn(function()
+    for i = 1, 3 do
+      client:send(pkt)
+      if i < 3 then cosock.socket.sleep(0.03) end
+    end
+  end, "burst_tx")
 end
 
 -- [Control 패킷 수신: 난방]
@@ -62,10 +88,14 @@ local function on_ctrl_packet(driver, raw_pkt)
   if not res then return end
 
   if res.kind == "thermostat" then
-    local dni = string.format("bestin-thermo-%d", res.room)
-    local dev = find_or_create_device(driver, dni, string.format("난방 %d번방", res.room), "bestin-thermostat")
+    local r = res.room
+    local dev = device_map[r] and device_map[r].thermo
+    if not dev then
+      dev = find_or_create_device(driver, string.format("bestin-thermo-%d", r), string.format("난방 %d번방", r), "bestin-thermostat")
+    end
 
     if dev and dev.emit_event then
+      local dni = dev.device_network_id
       last_state_cache[dni] = last_state_cache[dni] or {}
       local c = last_state_cache[dni]
 
@@ -86,32 +116,45 @@ local function on_ctrl_packet(driver, raw_pkt)
   end
 end
 
--- [Energy 패킷 수신: 조명, 콘센트 및 소비전력]
+-- [Energy 패킷 수신: 조명, 콘센트 및 소비전력 (고속 인덱싱)]
 local function on_energy_packet(driver, raw_pkt)
   local res = parser.parse_energy_packet(raw_pkt)
   if not res then return end
 
   if res.kind == "energy_combined" then
-    -- 1. 조명 상태 반영
+    local r = res.room
+    local r_devices = device_map[r]
+
+    -- 1. 조명 상태 처리 ($O(1)$)
     for idx, is_on in ipairs(res.lights) do
-      local light_dni = string.format("bestin-light-v2-r%d-c%d", res.room, idx)
-      local dev = find_or_create_device(driver, light_dni, string.format("조명 %d번방 %d", res.room, idx), "bestin-light")
+      local dev = r_devices and r_devices.lights and r_devices.lights[idx]
+      if not dev then
+        local dni = string.format("bestin-light-v2-r%d-c%d", r, idx)
+        dev = find_or_create_device(driver, dni, string.format("조명 %d번방 %d", r, idx), "bestin-light")
+      end
+
       if dev and dev.emit_event then
-        last_state_cache[light_dni] = last_state_cache[light_dni] or {}
-        if last_state_cache[light_dni].switch ~= is_on then
-          last_state_cache[light_dni].switch = is_on
+        local dni = dev.device_network_id
+        last_state_cache[dni] = last_state_cache[dni] or {}
+        if last_state_cache[dni].switch ~= is_on then
+          last_state_cache[dni].switch = is_on
           dev:emit_event(is_on and capabilities.switch.switch.on() or capabilities.switch.switch.off())
         end
       end
     end
 
-    -- 2. 콘센트 상태 및 실시간 소비전력 반영
+    -- 2. 콘센트 상태 및 실시간 소비전력 처리 ($O(1)$)
     for idx, is_on in ipairs(res.outlets) do
-      local outlet_dni = string.format("bestin-outlet-v2-r%d-c%d", res.room, idx)
-      local dev = find_or_create_device(driver, outlet_dni, string.format("콘센트 %d번방 %d", res.room, idx), "bestin-outlet")
+      local dev = r_devices and r_devices.outlets and r_devices.outlets[idx]
+      if not dev then
+        local dni = string.format("bestin-outlet-v2-r%d-c%d", r, idx)
+        dev = find_or_create_device(driver, dni, string.format("콘센트 %d번방 %d", r, idx), "bestin-outlet")
+      end
+
       if dev and dev.emit_event then
-        last_state_cache[outlet_dni] = last_state_cache[outlet_dni] or {}
-        local c = last_state_cache[outlet_dni]
+        local dni = dev.device_network_id
+        last_state_cache[dni] = last_state_cache[dni] or {}
+        local c = last_state_cache[dni]
 
         if c.switch ~= is_on then
           c.switch = is_on
@@ -158,22 +201,18 @@ local function handle_switch_on(driver, device, command)
 
   device:emit_event(capabilities.switch.switch.on())
 
-  -- 조명 제어
   local l_room, l_idx = dni:match("bestin%-light%-v2%-r(%d+)%-c(%d+)")
   if not l_room then l_room, l_idx = dni:match("bestin%-light%-(%d+)%-(%d+)") end
   if l_room and l_idx and energy_client then
     local pkt = parser.build_light_command(tonumber(l_room), tonumber(l_idx), true)
-    log.warn(string.format("🚀 [조명 ON 즉시 Burst 송신] %s", to_hex(pkt)))
     burst_send(energy_client, pkt)
     return
   end
 
-  -- 콘센트 제어
   local o_room, o_idx = dni:match("bestin%-outlet%-v2%-r(%d+)%-c(%d+)")
   if not o_room then o_room, o_idx = dni:match("bestin%-outlet%-(%d+)%-(%d+)") end
   if o_room and o_idx and energy_client then
     local pkt = parser.build_outlet_command(tonumber(o_room), tonumber(o_idx), true)
-    log.warn(string.format("🚀 [콘센트 ON 즉시 Burst 송신] %s", to_hex(pkt)))
     burst_send(energy_client, pkt)
     return
   end
@@ -186,28 +225,24 @@ local function handle_switch_off(driver, device, command)
 
   device:emit_event(capabilities.switch.switch.off())
 
-  -- 조명 제어
   local l_room, l_idx = dni:match("bestin%-light%-v2%-r(%d+)%-c(%d+)")
   if not l_room then l_room, l_idx = dni:match("bestin%-light%-(%d+)%-(%d+)") end
   if l_room and l_idx and energy_client then
     local pkt = parser.build_light_command(tonumber(l_room), tonumber(l_idx), false)
-    log.warn(string.format("🚀 [조명 OFF 즉시 Burst 송신] %s", to_hex(pkt)))
     burst_send(energy_client, pkt)
     return
   end
 
-  -- 콘센트 제어
   local o_room, o_idx = dni:match("bestin%-outlet%-v2%-r(%d+)%-c(%d+)")
   if not o_room then o_room, o_idx = dni:match("bestin%-outlet%-(%d+)%-(%d+)") end
   if o_room and o_idx and energy_client then
     local pkt = parser.build_outlet_command(tonumber(o_room), tonumber(o_idx), false)
-    log.warn(string.format("🚀 [콘센트 OFF 즉시 Burst 송신] %s", to_hex(pkt)))
     burst_send(energy_client, pkt)
     return
   end
 end
 
--- [난방 제어 핸들러]
+-- [난방 제어]
 local function handle_setpoint(driver, device, command)
   local room = device.device_network_id:match("bestin%-thermo%-(%d+)")
   local target_temp = command.args.setpoint
@@ -258,7 +293,7 @@ local bestin_driver = Driver("bestin-wallpad", {
   discovery = discovery_handler,
   lifecycle_handlers = {
     init = function(driver, device)
-      device_cache[device.device_network_id] = device
+      register_device_to_map(device)
       if device.device_network_id:find("bestin%-thermo") then
         device:emit_event(capabilities.thermostatMode.supportedThermostatModes({ "heat", "off" }))
       end
@@ -267,7 +302,6 @@ local bestin_driver = Driver("bestin-wallpad", {
       end
     end,
     removed = function(driver, device)
-      device_cache[device.device_network_id] = nil
       last_state_cache[device.device_network_id] = nil
     end,
     doConfigure = function(driver, device)

@@ -1,113 +1,86 @@
 local parser = {}
 
--- 베스틴 패킷 체크섬 계산
-function parser.calculate_checksum(bytes)
+-- 테이블 할당 없는 체크섬 계산
+function parser.calculate_checksum_raw(str, start_idx, end_idx)
   local sum = 3
-  for i = 1, #bytes do
-    sum = ((bytes[i] ~ sum) + 1) & 0xFF
+  for i = start_idx, end_idx do
+    sum = ((str:byte(i) ~ sum) + 1) & 0xFF
+  end
+  return sum
+end
+
+function parser.calculate_checksum_tbl(tbl, len)
+  local sum = 3
+  for i = 1, len do
+    sum = ((tbl[i] ~ sum) + 1) & 0xFF
   end
   return sum
 end
 
 -- ========================================================
--- [Energy 버스] 조명 / 콘센트 제어 및 상태 파싱
+-- [Energy 버스]
 -- ========================================================
 
--- 조명 제어 패킷
 function parser.build_light_command(room_idx, light_idx, is_on)
   local mask = 1 << (light_idx - 1)
   local cmd_byte7 = is_on and (0x80 | mask) or (0x00 | mask)
   local cmd_byte12 = is_on and 0x04 or 0x00
 
   local pkt = {
-    0x02,
-    0x31,
-    0x0D,
-    0x01,
-    0x00,            -- 5: 0x00 고정
-    room_idx & 0x0F, -- 6: 방 번호
-    cmd_byte7,       -- 7: 조명 제어 바이트
-    0x00,            -- 8
-    0x00,            -- 9
-    0x00,            -- 10
-    0x00,            -- 11
-    cmd_byte12,      -- 12: ON(0x04) / OFF(0x00)
-    0x00             -- 13: 체크섬 자리
+    0x02, 0x31, 0x0D, 0x01,
+    0x00, room_idx & 0x0F, cmd_byte7,
+    0x00, 0x00, 0x00, 0x00, cmd_byte12, 0x00
   }
-
-  pkt[13] = parser.calculate_checksum({table.unpack(pkt, 1, 12)})
+  pkt[13] = parser.calculate_checksum_tbl(pkt, 12)
   return string.char(table.unpack(pkt))
 end
 
--- 콘센트 제어 패킷
 function parser.build_outlet_command(room_idx, outlet_idx, is_on)
   local mask = 1 << (outlet_idx - 1)
   local cmd_byte8 = is_on and (0x80 | mask) or (0x00 | mask)
   local cmd_byte12 = is_on and 0x09 or 0x00
 
   local pkt = {
-    0x02,
-    0x31,
-    0x0D,
-    0x01,
-    0x00,            -- 5: 0x00 고정
-    room_idx & 0x0F, -- 6: 방 번호
-    0x00,            -- 7
-    cmd_byte8,       -- 8: 콘센트 제어 바이트
-    0x00,            -- 9
-    0x00,            -- 10
-    0x00,            -- 11
-    cmd_byte12,      -- 12: ON(0x09) / OFF(0x00)
-    0x00             -- 13: 체크섬 자리
+    0x02, 0x31, 0x0D, 0x01,
+    0x00, room_idx & 0x0F, 0x00, cmd_byte8,
+    0x00, 0x00, 0x00, cmd_byte12, 0x00
   }
-
-  pkt[13] = parser.calculate_checksum({table.unpack(pkt, 1, 12)})
+  pkt[13] = parser.calculate_checksum_tbl(pkt, 12)
   return string.char(table.unpack(pkt))
 end
 
--- Energy 라인 수신 패킷 파싱 (소비전력: bytes[15]~[18], /10.0 W)
 function parser.parse_energy_packet(raw_bytes)
-  if #raw_bytes < 4 or raw_bytes:byte(1) ~= 0x02 then return nil end
-  local header = raw_bytes:byte(2)
-  local len = raw_bytes:byte(3)
-  if #raw_bytes < len then return nil end
+  local len = #raw_bytes
+  if len < 30 or raw_bytes:byte(1) ~= 0x02 then return nil end
 
-  local bytes = {raw_bytes:byte(1, len)}
-  if parser.calculate_checksum({table.unpack(bytes, 1, len - 1)}) ~= bytes[len] then
+  local header = raw_bytes:byte(2)
+  local pkt_len = raw_bytes:byte(3)
+  if len < pkt_len or pkt_len < 30 then return nil end
+
+  -- 임시 테이블 생성 없이 직접 바이트 비교
+  if parser.calculate_checksum_raw(raw_bytes, 1, pkt_len - 1) ~= raw_bytes:byte(pkt_len) then
     return nil
   end
 
-  local cmd = bytes[4]
+  local cmd = raw_bytes:byte(4)
+  if header == 0x31 and (cmd == 0x91 or cmd == 0x81 or cmd == 0x92) then
+    local room = raw_bytes:byte(6) & 0x0F
 
-  -- 30바이트 통합 에너지 패킷
-  if header == 0x31 and (cmd == 0x91 or cmd == 0x81 or cmd == 0x92) and len >= 30 then
-    local room = bytes[6] & 0x0F
+    local b7 = raw_bytes:byte(7)
+    local l1_on = ((b7 & 0x01) == 0x01)
+    local l2_on = (((b7 >> 1) & 0x01) == 0x01)
 
-    -- [조명 상태] 1 = ON, 0 = OFF
-    local l1_on = ((bytes[7] & 0x01) == 0x01)
-    local l2_on = (((bytes[7] >> 1) & 0x01) == 0x01)
-
-    -- [콘센트 상태]
-    local o1_on = ((bytes[8] & 0x01) == 0x01)
-    local o2_on = (((bytes[8] >> 1) & 0x01) == 0x01)
-    if bytes[9] and bytes[9] > 0 then
-      o2_on = ((bytes[9] & 0x01) == 0x01)
+    local b8 = raw_bytes:byte(8)
+    local b9 = raw_bytes:byte(9)
+    local o1_on = ((b8 & 0x01) == 0x01)
+    local o2_on = (((b8 >> 1) & 0x01) == 0x01)
+    if b9 and b9 > 0 then
+      o2_on = ((b9 & 0x01) == 0x01)
     end
 
-    -- [실시간 소비전력: bytes[15]~[18], / 10.0 W]
-    -- 1번 콘센트 실시간 소비전력: bytes[15], bytes[16]
-    local p1 = 0.0
-    if bytes[15] and bytes[16] then
-      local raw_p1 = (bytes[15] << 8) | bytes[16]
-      p1 = raw_p1 / 10.0
-    end
-
-    -- 2번 콘센트 실시간 소비전력: bytes[17], bytes[18]
-    local p2 = 0.0
-    if bytes[17] and bytes[18] then
-      local raw_p2 = (bytes[17] << 8) | bytes[18]
-      p2 = raw_p2 / 10.0
-    end
+    -- 소비전력: bytes[15..18], / 10.0
+    local p1 = ((raw_bytes:byte(15) << 8) | raw_bytes:byte(16)) / 10.0
+    local p2 = ((raw_bytes:byte(17) << 8) | raw_bytes:byte(18)) / 10.0
 
     return {
       kind = "energy_combined",
@@ -122,7 +95,7 @@ function parser.parse_energy_packet(raw_bytes)
 end
 
 -- ========================================================
--- [Control 버스] 난방
+-- [Control 버스]
 -- ========================================================
 
 function parser.build_thermostat_command(room_idx, is_on, target_temp)
@@ -131,36 +104,34 @@ function parser.build_thermostat_command(room_idx, is_on, target_temp)
 
   local pkt = {
     0x02, 0x28, 0x0E, 0x12,
-    0x00,
-    room_idx & 0x0F,
+    0x00, room_idx & 0x0F,
     is_on and 0x01 or 0x02,
-    t_int,
-    t_dec,
-    0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00
+    t_int, t_dec,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00
   }
-  pkt[14] = parser.calculate_checksum({table.unpack(pkt, 1, 13)})
+  pkt[14] = parser.calculate_checksum_tbl(pkt, 13)
   return string.char(table.unpack(pkt))
 end
 
 function parser.parse_control_packet(raw_bytes)
-  if #raw_bytes < 4 or raw_bytes:byte(1) ~= 0x02 then return nil end
-  local header = raw_bytes:byte(2)
-  local len = raw_bytes:byte(3)
-  if #raw_bytes < len then return nil end
+  local len = #raw_bytes
+  if len < 8 or raw_bytes:byte(1) ~= 0x02 then return nil end
 
-  local bytes = {raw_bytes:byte(1, len)}
-  if parser.calculate_checksum({table.unpack(bytes, 1, len - 1)}) ~= bytes[len] then
+  local header = raw_bytes:byte(2)
+  local pkt_len = raw_bytes:byte(3)
+  if len < pkt_len or pkt_len < 8 then return nil end
+
+  if parser.calculate_checksum_raw(raw_bytes, 1, pkt_len - 1) ~= raw_bytes:byte(pkt_len) then
     return nil
   end
 
-  if header == 0x28 and len >= 8 then
-    local room = bytes[6] & 0x0F
-    local is_on = (bytes[7] == 0x01)
-    local cur_int = bytes[8] or 20
-    local cur_dec = bytes[9] or 0
-    local target_int = bytes[10] or 22
-    local target_dec = bytes[11] or 0
+  if header == 0x28 then
+    local room = raw_bytes:byte(6) & 0x0F
+    local is_on = (raw_bytes:byte(7) == 0x01)
+    local cur_int = raw_bytes:byte(8) or 20
+    local cur_dec = raw_bytes:byte(9) or 0
+    local target_int = raw_bytes:byte(10) or 22
+    local target_dec = raw_bytes:byte(11) or 0
 
     local cur_temp = cur_int + (cur_dec / 10.0)
     local target_temp = target_int + (target_dec / 10.0)
